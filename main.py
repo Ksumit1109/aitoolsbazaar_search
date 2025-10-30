@@ -5,7 +5,6 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from typing import List, Optional
 from pydantic import BaseModel
-from difflib import SequenceMatcher
 import os
 import httpx
 import uvicorn
@@ -46,7 +45,7 @@ class SearchResponse(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     limit: int = 10
-    search_type: str = "hybrid"  # hybrid | semantic | exact
+    search_type: Optional[str] = "auto"  # auto | hybrid | semantic | exact
 
 
 # ---------- LIFECYCLE ----------
@@ -70,7 +69,6 @@ async def shutdown():
 
 # ---------- UTILS ----------
 async def get_embedding(text: str) -> List[float]:
-    """Call local embedding service to get text embedding."""
     try:
         async with httpx.AsyncClient(timeout=30) as cli:
             resp = await cli.post(EMBED_URL, json={"text": text})
@@ -82,7 +80,6 @@ async def get_embedding(text: str) -> List[float]:
 
 
 def format_search_result(doc: dict, score: Optional[float], match_type: str) -> SearchResponse:
-    """Convert MongoDB doc to Pydantic response model."""
     return SearchResponse(
         id=str(doc.get("_id", "")),
         name=doc.get("name", ""),
@@ -92,14 +89,8 @@ def format_search_result(doc: dict, score: Optional[float], match_type: str) -> 
     )
 
 
-def text_similarity(a: str, b: str) -> float:
-    """Compute string similarity ratio between 0 and 1."""
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
-
-
 # ---------- SEARCH CORE ----------
 async def exact_search(query: str, limit: int) -> List[SearchResponse]:
-    """Perform exact text + autocomplete search with reranking."""
     pipeline = [
         {
             "$search": {
@@ -108,38 +99,28 @@ async def exact_search(query: str, limit: int) -> List[SearchResponse]:
                     "should": [
                         {"text": {"query": query, "path": "name", "score": {"boost": {"value": 5}}}},
                         {"autocomplete": {"query": query, "path": "name", "score": {"boost": {"value": 3}}}},
-                        {"text": {"query": query, "path": "description"}},
+                        {"text": {"query": query, "path": "description", "score": {"boost": {"value": 2}}}},
                         {"text": {"query": query, "path": "tags"}},
                     ],
                     "minimumShouldMatch": 1,
-                },
+                }
             }
         },
         {"$addFields": {"search_score": {"$meta": "searchScore"}}},
-        {"$limit": limit * 3},  # fetch more results for better reranking
+        {"$sort": {"search_score": -1}},
+        {"$limit": limit},
     ]
+    results = [format_search_result(doc, doc.get("search_score"), "exact") async for doc in collection.aggregate(pipeline)]
 
-    results = [
-        format_search_result(doc, doc.get("search_score"), "exact")
-        async for doc in collection.aggregate(pipeline)
-    ]
+    # Boost exact title matches
+    for res in results:
+        if res.name.strip().lower() == query.strip().lower():
+            res.score += 5
 
-    # Custom reranking: exact matches and prefix matches boosted
-    def rerank(item: SearchResponse) -> float:
-        name_lower = item.name.lower()
-        query_lower = query.lower()
-        if name_lower == query_lower:
-            return item.score + 10.0  # exact match
-        elif name_lower.startswith(query_lower):
-            return item.score + 5.0   # prefix match
-        return item.score
-
-    results.sort(key=lambda x: rerank(x), reverse=True)
-    return results[:limit]
+    return sorted(results, key=lambda x: x.score, reverse=True)
 
 
 async def semantic_search(query: str, limit: int) -> List[SearchResponse]:
-    """Perform semantic vector-based search with text similarity rerank."""
     vector = await get_embedding(query)
     pipeline = [
         {
@@ -148,34 +129,17 @@ async def semantic_search(query: str, limit: int) -> List[SearchResponse]:
                 "path": "embedding",
                 "queryVector": vector,
                 "numCandidates": limit * 10,
-                "limit": limit * 3,
+                "limit": limit,
             }
         },
         {"$addFields": {"vector_score": {"$meta": "vectorSearchScore"}}},
     ]
-
-    results = [
-        format_search_result(doc, doc.get("vector_score"), "semantic")
-        async for doc in collection.aggregate(pipeline)
-    ]
-
-    # Add string similarity boost
-    for r in results:
-        sim = text_similarity(query, r.name)
-        if r.name.lower() == query.lower():
-            r.score += 10.0
-        elif r.name.lower().startswith(query.lower()):
-            r.score += 5.0
-        else:
-            r.score += sim * 5.0
-
-    results.sort(key=lambda x: x.score, reverse=True)
-    return results[:limit]
+    return [format_search_result(doc, doc.get("vector_score"), "semantic") async for doc in collection.aggregate(pipeline)]
 
 
 async def hybrid_search(query: str, limit: int) -> List[SearchResponse]:
-    """Combine vector and text search results, then rerank."""
     vector = await get_embedding(query)
+
     pipeline = [
         {
             "$vectorSearch": {
@@ -183,7 +147,7 @@ async def hybrid_search(query: str, limit: int) -> List[SearchResponse]:
                 "path": "embedding",
                 "queryVector": vector,
                 "numCandidates": limit * 10,
-                "limit": limit * 3,
+                "limit": limit,
             }
         },
         {"$addFields": {"vs_score": {"$meta": "vectorSearchScore"}}},
@@ -199,12 +163,12 @@ async def hybrid_search(query: str, limit: int) -> List[SearchResponse]:
                                     {"text": {"query": query, "path": "name", "score": {"boost": {"value": 5}}}},
                                     {"autocomplete": {"query": query, "path": "name", "score": {"boost": {"value": 3}}}},
                                     {"text": {"query": query, "path": "description"}},
-                                ],
-                            },
+                                ]
+                            }
                         }
                     },
+                    {"$limit": limit},
                     {"$addFields": {"fts_score": {"$meta": "searchScore"}}},
-                    {"$limit": limit * 3},
                 ],
             }
         },
@@ -217,38 +181,50 @@ async def hybrid_search(query: str, limit: int) -> List[SearchResponse]:
                 "fts_score": {"$max": "$fts_score"},
             }
         },
+        # Normalize & weight
         {
             "$project": {
                 "name": 1,
                 "description": 1,
-                "score": {
-                    "$add": [
-                        {"$ifNull": ["$vs_score", 0]},
-                        {"$ifNull": ["$fts_score", 0]},
-                    ]
+                "normalized_vs": {
+                    "$divide": [{"$ifNull": ["$vs_score", 0]}, 1.0]
+                },
+                "normalized_fts": {
+                    "$divide": [{"$ifNull": ["$fts_score", 0]}, 100.0]
                 },
             }
         },
+        {
+            "$addFields": {
+                "score": {
+                    "$add": [
+                        {"$multiply": ["$normalized_vs", 0.4]},
+                        {"$multiply": ["$normalized_fts", 0.6]},
+                    ]
+                }
+            }
+        },
+        # Boost exact name match
+        {
+            "$addFields": {
+                "exact_match_boost": {
+                    "$cond": [
+                        {"$eq": [{"$toLower": "$name"}, query.lower()]},
+                        1,
+                        0
+                    ]
+                }
+            }
+        },
+        {"$addFields": {"score": {"$add": ["$score", "$exact_match_boost"]}}},
         {"$sort": {"score": -1}},
+        {"$limit": limit},
     ]
 
-    results = [
-        format_search_result(doc, doc.get("score"), "hybrid")
-        async for doc in collection.aggregate(pipeline)
-    ]
-
-    # Post reranking
-    for r in results:
-        sim = text_similarity(query, r.name)
-        if r.name.lower() == query.lower():
-            r.score += 10.0
-        elif r.name.lower().startswith(query.lower()):
-            r.score += 5.0
-        else:
-            r.score += sim * 3.0
-
-    results.sort(key=lambda x: x.score, reverse=True)
-    return results[:limit]
+    results = []
+    async for doc in collection.aggregate(pipeline):
+        results.append(format_search_result(doc, doc.get("score"), "hybrid"))
+    return results
 
 
 # ---------- ROUTES ----------
@@ -265,20 +241,32 @@ async def health():
 
 @app.post("/search", response_model=List[SearchResponse])
 async def search_tools(request: SearchRequest):
-    if not request.query or not request.query.strip():
+    query = request.query.strip()
+    if not query:
         raise HTTPException(400, "Query cannot be empty")
-    if not 1 <= request.limit <= 100:
-        raise HTTPException(400, "Limit must be 1-100")
 
-    try:
-        if request.search_type == "exact":
-            return await exact_search(request.query, request.limit)
-        elif request.search_type == "semantic":
-            return await semantic_search(request.query, request.limit)
+    limit = max(1, min(request.limit, 100))
+    search_type = (request.search_type or "auto").lower()
+
+    # ---------- AUTO-DETECT SEARCH TYPE ----------
+    if search_type == "auto":
+        words = query.split()
+        if query.endswith("?") or len(words) > 5:
+            search_type = "semantic"
+        elif len(words) <= 2 and query.replace(" ", "").isalnum():
+            search_type = "exact"
         else:
-            return await hybrid_search(request.query, request.limit)
-    except HTTPException:
-        raise
+            search_type = "hybrid"
+        logger.info(f"🔍 Auto-detected search type: {search_type}")
+
+    # ---------- EXECUTE SEARCH ----------
+    try:
+        if search_type == "exact":
+            return await exact_search(query, limit)
+        elif search_type == "semantic":
+            return await semantic_search(query, limit)
+        else:
+            return await hybrid_search(query, limit)
     except Exception as e:
         logger.exception("Search error")
         raise HTTPException(500, f"Search failed: {e}")
@@ -288,9 +276,8 @@ async def search_tools(request: SearchRequest):
 async def search_tools_get(
     q: str = Query(..., description="Search query"),
     limit: int = Query(10, ge=1, le=100),
-    type: str = Query("hybrid", regex="^(hybrid|semantic|exact)$"),
+    type: str = Query("auto", regex="^(auto|hybrid|semantic|exact)$"),
 ):
-    """GET endpoint for browser-based testing."""
     return await search_tools(SearchRequest(query=q, limit=limit, search_type=type))
 
 
