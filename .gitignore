@@ -1,48 +1,28 @@
-# ---- Python ----
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
-*.egg
-*.egg-info/
-dist/
-build/
-.eggs/
 .Python
-
-# ---- Environments ----
-.env
-.venv/
 venv/
-ENV/
 env/
-pip-wheel-metadata/
-*.log
+ENV/
+.venv
 
-# ---- IDE & Editors ----
+# Environment variables
+.env
+.env.local
+
+# IDEs
 .vscode/
 .idea/
 *.swp
+*.swo
+
+# OS
 .DS_Store
 Thumbs.db
 
-# ---- Cache ----
-*.sqlite3
-__pypackages__/
+# Models cache
+models/
 .cache/
-pytest_cache/
-.mypy_cache/
-.pytest_cache/
-.coverage
-htmlcov/
-
-# ---- System Files ----
-*.bak
-*.tmp
-*.old
-
-# ---- Node (if embedding frontend) ----
-node_modules/
-*.tsbuildinfo
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*

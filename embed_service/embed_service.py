@@ -1,13 +1,23 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from typing import List
 import uvicorn
+import os
 
 app = FastAPI(title="Embedding Service")
 
-# Load model on startup (adjust model based on your needs)
-# Options: 'all-MiniLM-L6-v2' (384 dim), 'all-mpnet-base-v2' (768 dim)
+# Add CORS middleware for cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Load model on startup
 model = None
 
 class EmbedRequest(BaseModel):
@@ -26,7 +36,18 @@ async def load_model():
 
 @app.get("/")
 async def root():
-    return {"message": "Embedding Service Running", "model": "all-MiniLM-L6-v2"}
+    return {
+        "message": "Embedding Service Running", 
+        "model": "all-MiniLM-L6-v2",
+        "dimensions": 384
+    }
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None
+    }
 
 @app.post("/embed", response_model=EmbedResponse)
 async def get_embedding(request: EmbedRequest):
@@ -43,9 +64,10 @@ async def get_embedding(request: EmbedRequest):
         raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
 
 if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8001))
     uvicorn.run(
         "embed_service:app",
         host="0.0.0.0",
-        port=8001,
+        port=port,
         reload=False
     )

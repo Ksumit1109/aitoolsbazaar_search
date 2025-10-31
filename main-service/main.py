@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -15,8 +14,8 @@ load_dotenv()
 MONGO_URI      = os.getenv("MONGODB_URI")
 DB_NAME        = os.getenv("DB_NAME")
 COLLECTION     = os.getenv("COLLECTION_NAME")
-EMBED_PORT     = os.getenv("EMBED_SERVICE_PORT", "8001")
-EMBED_URL      = f"http://localhost:{EMBED_PORT}/embed"
+# Use environment variable for embed service URL (important for Render deployment)
+EMBED_URL      = os.getenv("EMBED_SERVICE_URL", "http://localhost:8001/embed")
 INDEX_NAME     = "hybrid_index"
 
 # ---------- LOGGING ----------
@@ -58,6 +57,7 @@ async def startup():
     client = AsyncIOMotorClient(MONGO_URI)
     db, collection = client[DB_NAME], client[DB_NAME][COLLECTION]
     logger.info("✅ MongoDB connected")
+    logger.info(f"🔗 Embed service URL: {EMBED_URL}")
 
 
 @app.on_event("shutdown")
@@ -283,4 +283,5 @@ async def search_tools_get(
 
 # ---------- RUN ----------
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
